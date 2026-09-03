@@ -13,21 +13,30 @@
   .stat .label{font-size:.72rem;color:var(--muted);text-transform:uppercase}
   .stat .value{font-size:1.15rem;font-weight:600;margin-top:2px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px}
+  .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .card-header strong{font-size:.95rem}
   form{display:flex;flex-wrap:wrap;gap:8px}
   input[type=text]{flex:1;min-width:180px;background:#0f1115;border:1px solid var(--border);color:var(--text);padding:9px 10px;border-radius:8px}
   input[type=file]{color:var(--muted);font-size:.85rem}
   button{background:var(--accent);color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer}
   button.secondary{background:#2a2e38}
+  button.danger{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px;font-size:.75rem;font-weight:500}
   .torrent{border-bottom:1px solid var(--border);padding:10px 0}
   .torrent:last-child{border-bottom:0}
   .torrent .name{font-weight:600;font-size:.9rem;word-break:break-word}
   .bar{height:6px;background:#0f1115;border-radius:4px;overflow:hidden;margin:6px 0}
   .bar-fill{height:100%;background:var(--accent)}
-  .meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.78rem;color:var(--muted)}
+  .meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.78rem;color:var(--muted);align-items:center}
   .meta span.up{color:var(--good)}
-  .files a{color:var(--accent);text-decoration:none;font-size:.85rem}
-  .files li{margin-bottom:6px}
-  .empty{color:var(--muted);font-size:.85rem}
+  .files{list-style:none;padding:0;margin:0}
+  .files li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:.85rem}
+  .files li:last-child{border-bottom:0}
+  .files a{color:var(--accent);text-decoration:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .file-size{font-size:.75rem;color:var(--muted);white-space:nowrap}
+  .empty{color:var(--muted);font-size:.85rem;margin:0}
+  .seed-badge{font-size:.72rem;padding:3px 8px;border-radius:6px;font-weight:600}
+  .seed-off{background:rgba(255,92,92,.12);color:var(--bad)}
+  .seed-on{background:rgba(62,207,142,.12);color:var(--good)}
 </style>
 </head>
 <body>
@@ -51,7 +60,10 @@
 </div>
 
 <div class="card">
-  <strong>Downloaded files</strong>
+  <div class="card-header">
+    <strong>Downloaded files</strong>
+    <span id="seedBadge" class="seed-badge"></span>
+  </div>
   <ul class="files" id="fileList"><li class="empty">No files yet.</li></ul>
 </div>
 
@@ -72,6 +84,14 @@ async function refreshSystem(){
     <div class="stat"><div class="label">Total BW</div><div class="value">${d.total_bandwidth_gb} GB</div></div>
     <div class="stat"><div class="label">This Month</div><div class="value">${d.monthly_bandwidth_gb} GB</div></div>
   `;
+  const badge = document.getElementById('seedBadge');
+  if(d.seeding_enabled){
+    badge.textContent = '🌱 Seeding: ON';
+    badge.className = 'seed-badge seed-on';
+  } else {
+    badge.textContent = '🚫 Seeding: OFF';
+    badge.className = 'seed-badge seed-off';
+  }
 }
 
 async function refreshTorrents(){
@@ -88,7 +108,7 @@ async function refreshTorrents(){
         <span class="up">↑ ${t.upload_rate} KB/s</span>
         <span>Seeds: ${t.num_seeds}</span>
         <span>Peers: ${t.num_leechers}</span>
-        <span>${t.state}</span>
+        <span>${t.paused ? 'paused' : t.state}</span>
         <button class="secondary" style="padding:3px 8px;font-size:.75rem" onclick="removeTorrent('${t.hash}')">Remove</button>
       </div>
     </div>
@@ -99,12 +119,24 @@ async function refreshFiles(){
   const r = await fetch('/api/files'); const list = await r.json();
   const el = document.getElementById('fileList');
   if(!list.length){ el.innerHTML='<li class="empty">No files yet.</li>'; return; }
-  el.innerHTML = list.map(f => `<li><a href="/download/${encodeURIComponent(f.path)}" download>${f.name}</a> — ${fmtBytes(f.size)}</li>`).join('');
+  el.innerHTML = list.map(f => `
+    <li>
+      <a href="/download/${encodeURIComponent(f.path)}" download>${f.name}</a>
+      <span class="file-size">${fmtBytes(f.size)}</span>
+      <button class="danger" onclick="deleteFile('${f.path.replace(/'/g, "\\'")}')">Delete</button>
+    </li>
+  `).join('');
 }
 
 async function removeTorrent(hash){
   await fetch(`/api/remove/${hash}?delete_files=false`, {method:'POST'});
   refreshTorrents();
+}
+
+async function deleteFile(path){
+  if(!confirm('Delete this file from the server? This cannot be undone.')) return;
+  await fetch(`/api/files/${encodeURIComponent(path)}`, {method:'DELETE'});
+  refreshFiles();
 }
 
 document.getElementById('magnetForm').addEventListener('submit', async e => {

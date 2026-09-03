@@ -25,7 +25,7 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 app = FastAPI()
 
-# ---- libtorrent session (settings sourced from config.py) ----
+# ---- libtorrent session ----
 lt_session = lt.session()
 lt_session.apply_settings(config.LT_SETTINGS)
 if config.ENABLE_DHT:
@@ -40,36 +40,48 @@ mongo_client = AsyncIOMotorClient(config.MONGO_URI) if config.MONGO_URI else Non
 db = mongo_client[config.DB_NAME] if mongo_client is not None else None
 last_total_download = 0
 
-async def bandwidth_tracker():
+async def background_loop():
+    """Runs bandwidth accounting and, when seeding is disabled, force-pauses
+    any torrent the instant it finishes so it stops uploading entirely."""
     global last_total_download
     while True:
         await asyncio.sleep(config.BANDWIDTH_TRACK_INTERVAL_SEC)
-        if db is None:
-            continue
-        current = lt_session.status().total_download
-        delta = current - last_total_download
-        if delta > 0:
-            last_total_download = current
-            month_key = datetime.utcnow().strftime("%Y-%m")
-            await db.bandwidth.update_one({"_id": "total"}, {"$inc": {"bytes": delta}}, upsert=True)
-            await db.bandwidth.update_one({"_id": month_key}, {"$inc": {"bytes": delta}}, upsert=True)
+
+        if db is not None:
+            current = lt_session.status().total_download
+            delta = current - last_total_download
+            if delta > 0:
+                last_total_download = current
+                month_key = datetime.utcnow().strftime("%Y-%m")
+                await db.bandwidth.update_one({"_id": "total"}, {"$inc": {"bytes": delta}}, upsert=True)
+                await db.bandwidth.update_one({"_id": month_key}, {"$inc": {"bytes": delta}}, upsert=True)
+
+        if not config.SEEDING_ENABLED:
+            for h in list(handles.values()):
+                if not h.is_valid():
+                    continue
+                s = h.status()
+                if s.is_finished and not s.paused:
+                    h.pause()  # belt-and-braces: stop all network activity once done
 
 @app.on_event("startup")
 async def startup():
-    if db is not None:
-        # hydrate in-memory counter from persisted total so deltas stay correct
-        doc = await db.bandwidth.find_one({"_id": "total"})
-        # note: total_download resets to 0 each process start (libtorrent session is fresh),
-        # so last_total_download stays 0 here — this is just a safe place to add
-        # any future startup hydration logic if needed.
-    asyncio.create_task(bandwidth_tracker())
+    asyncio.create_task(background_loop())
 
 # ---- add torrents ----
+def _post_add_setup(h):
+    if config.ADD_EXTRA_TRACKERS:
+        for url in config.EXTRA_TRACKERS:
+            h.add_tracker({'url': url, 'tier': 1})
+    if not config.SEEDING_ENABLED:
+        h.set_upload_limit(config.NO_SEED_UPLOAD_LIMIT_BYTES)  # near-zero upload even while downloading
+
 def add_magnet(uri: str):
     params = lt.parse_magnet_uri(uri)
     params.save_path = str(config.DOWNLOAD_DIR)
     params.storage_mode = lt.storage_mode_t.storage_mode_sparse
     h = lt_session.add_torrent(params)
+    _post_add_setup(h)
     handles[str(h.info_hash())] = h
     return h
 
@@ -80,6 +92,7 @@ def add_torrent_file(path: str):
         'save_path': str(config.DOWNLOAD_DIR),
         'storage_mode': lt.storage_mode_t.storage_mode_sparse,
     })
+    _post_add_setup(h)
     handles[str(h.info_hash())] = h
     return h
 
@@ -142,6 +155,7 @@ async def api_status(auth: bool = Depends(check_auth)):
             "total_size": s.total_wanted,
             "downloaded": s.total_wanted_done,
             "is_finished": s.is_finished,
+            "paused": s.paused,
         })
     return result
 
@@ -164,6 +178,7 @@ async def api_system(auth: bool = Depends(check_auth)):
         "disk_total_gb": round(disk.total / 1024**3, 2),
         "total_bandwidth_gb": round(total_bw / 1024**3, 3),
         "monthly_bandwidth_gb": round(monthly_bw / 1024**3, 3),
+        "seeding_enabled": config.SEEDING_ENABLED,
     }
 
 @app.get("/api/files")
@@ -178,15 +193,34 @@ async def api_files(auth: bool = Depends(check_auth)):
             })
     return files
 
-@app.get("/download/{file_path:path}")
-async def download_file(file_path: str, auth: bool = Depends(check_auth)):
+def _safe_resolve(file_path: str) -> Path:
     base = config.DOWNLOAD_DIR.resolve()
     full_path = (config.DOWNLOAD_DIR / file_path).resolve()
     if not str(full_path).startswith(str(base)):
         raise HTTPException(403, "forbidden")
+    return full_path
+
+@app.get("/download/{file_path:path}")
+async def download_file(file_path: str, auth: bool = Depends(check_auth)):
+    full_path = _safe_resolve(file_path)
     if not full_path.exists():
         raise HTTPException(404, "not found")
     return FileResponse(full_path, filename=full_path.name)
+
+@app.delete("/api/files/{file_path:path}")
+async def delete_file(file_path: str, auth: bool = Depends(check_auth)):
+    full_path = _safe_resolve(file_path)
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(404, "not found")
+    full_path.unlink()
+    # clean up now-empty parent directories back up to DOWNLOAD_DIR
+    parent = full_path.parent
+    base = config.DOWNLOAD_DIR.resolve()
+    while parent != base and parent.exists() and not any(parent.iterdir()):
+        empty_dir = parent
+        parent = parent.parent
+        empty_dir.rmdir()
+    return {"ok": True}
 
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seedbox</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--border:#2a2e38;--accent:#4f8cff;--text:#e6e8ec;--muted:#8a8f9c;--good:#3ecf8e;--bad:#ff5c5c}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
+  h1{font-size:1.3rem;margin:0 0 16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px}
+  .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px}
+  .stat .label{font-size:.72rem;color:var(--muted);text-transform:uppercase}
+  .stat .value{font-size:1.15rem;font-weight:600;margin-top:2px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px}
+  form{display:flex;flex-wrap:wrap;gap:8px}
+  input[type=text]{flex:1;min-width:180px;background:#0f1115;border:1px solid var(--border);color:var(--text);padding:9px 10px;border-radius:8px}
+  input[type=file]{color:var(--muted);font-size:.85rem}
+  button{background:var(--accent);color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer}
+  button.secondary{background:#2a2e38}
+  .torrent{border-bottom:1px solid var(--border);padding:10px 0}
+  .torrent:last-child{border-bottom:0}
+  .torrent .name{font-weight:600;font-size:.9rem;word-break:break-word}
+  .bar{height:6px;background:#0f1115;border-radius:4px;overflow:hidden;margin:6px 0}
+  .bar-fill{height:100%;background:var(--accent)}
+  .meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.78rem;color:var(--muted)}
+  .meta span.up{color:var(--good)}
+  .files a{color:var(--accent);text-decoration:none;font-size:.85rem}
+  .files li{margin-bottom:6px}
+  .empty{color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>🌱 Seedbox</h1>
+
+<div class="grid" id="sysGrid"></div>
+
+<div class="card">
+  <form id="magnetForm">
+    <input type="text" id="magnetInput" placeholder="Paste magnet link...">
+    <button type="submit">Add Magnet</button>
+  </form>
+  <form id="fileForm" style="margin-top:10px">
+    <input type="file" id="torrentInput" accept=".torrent">
+    <button type="submit" class="secondary">Upload .torrent</button>
+  </form>
+</div>
+
+<div class="card">
+  <div id="torrentList"><p class="empty">No active torrents.</p></div>
+</div>
+
+<div class="card">
+  <strong>Downloaded files</strong>
+  <ul class="files" id="fileList"><li class="empty">No files yet.</li></ul>
+</div>
+
+<script>
+function fmtBytes(b){
+  if(!b) return '0 B';
+  const u=['B','KB','MB','GB','TB'];let i=0;
+  while(b>=1024&&i<u.length-1){b/=1024;i++}
+  return b.toFixed(1)+' '+u[i];
+}
+
+async function refreshSystem(){
+  const r = await fetch('/api/system'); const d = await r.json();
+  document.getElementById('sysGrid').innerHTML = `
+    <div class="stat"><div class="label">RAM</div><div class="value">${d.ram_used_mb}/${d.ram_total_mb} MB</div></div>
+    <div class="stat"><div class="label">CPU</div><div class="value">${d.cpu_percent}%</div></div>
+    <div class="stat"><div class="label">Disk</div><div class="value">${d.disk_used_gb}/${d.disk_total_gb} GB</div></div>
+    <div class="stat"><div class="label">Total BW</div><div class="value">${d.total_bandwidth_gb} GB</div></div>
+    <div class="stat"><div class="label">This Month</div><div class="value">${d.monthly_bandwidth_gb} GB</div></div>
+  `;
+}
+
+async function refreshTorrents(){
+  const r = await fetch('/api/status'); const list = await r.json();
+  const el = document.getElementById('torrentList');
+  if(!list.length){ el.innerHTML='<p class="empty">No active torrents.</p>'; return; }
+  el.innerHTML = list.map(t => `
+    <div class="torrent">
+      <div class="name">${t.name}</div>
+      <div class="bar"><div class="bar-fill" style="width:${t.progress}%"></div></div>
+      <div class="meta">
+        <span>${t.progress}%</span>
+        <span>↓ ${t.download_rate} KB/s</span>
+        <span class="up">↑ ${t.upload_rate} KB/s</span>
+        <span>Seeds: ${t.num_seeds}</span>
+        <span>Peers: ${t.num_leechers}</span>
+        <span>${t.state}</span>
+        <button class="secondary" style="padding:3px 8px;font-size:.75rem" onclick="removeTorrent('${t.hash}')">Remove</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function refreshFiles(){
+  const r = await fetch('/api/files'); const list = await r.json();
+  const el = document.getElementById('fileList');
+  if(!list.length){ el.innerHTML='<li class="empty">No files yet.</li>'; return; }
+  el.innerHTML = list.map(f => `<li><a href="/download/${encodeURIComponent(f.path)}" download>${f.name}</a> — ${fmtBytes(f.size)}</li>`).join('');
+}
+
+async function removeTorrent(hash){
+  await fetch(`/api/remove/${hash}?delete_files=false`, {method:'POST'});
+  refreshTorrents();
+}
+
+document.getElementById('magnetForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const val = document.getElementById('magnetInput').value.trim();
+  if(!val) return;
+  const fd = new FormData(); fd.append('magnet', val);
+  await fetch('/api/add_magnet', {method:'POST', body: fd});
+  document.getElementById('magnetInput').value = '';
+  refreshTorrents();
+});
+
+document.getElementById('fileForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const inp = document.getElementById('torrentInput');
+  if(!inp.files.length) return;
+  const fd = new FormData(); fd.append('file', inp.files[0]);
+  await fetch('/api/add_torrent', {method:'POST', body: fd});
+  inp.value = '';
+  refreshTorrents();
+});
+
+function tick(){ refreshSystem(); refreshTorrents(); refreshFiles(); }
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
